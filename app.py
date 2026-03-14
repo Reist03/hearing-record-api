@@ -10,6 +10,8 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
+        "https://kawatsu624.hiho.jp",
+        "http://kawatsu624.hiho.jp",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ],
@@ -18,36 +20,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ここでタイムアウトを明示
-client = OpenAI(timeout=60.0)
+client = None
+startup_error = None
+
+try:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if api_key:
+        client = OpenAI(api_key=api_key, timeout=60.0)
+    else:
+        startup_error = "OPENAI_API_KEY is not set"
+except Exception as e:
+    startup_error = f"OpenAI client init failed: {str(e)}"
+
+
+@app.get("/")
+def root():
+    return {"ok": True, "startup_error": startup_error}
 
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "startup_error": startup_error}
 
 
-@app.get("/api/openai-check")
-def openai_check():
-    has_key = bool(os.getenv("OPENAI_API_KEY"))
-    return {
-        "ok": True,
-        "has_openai_api_key": has_key
-    }
+@app.post("/api/transcribe")
+async def transcribe(audio: UploadFile = File(...)):
+    if startup_error:
+        raise HTTPException(status_code=500, detail=startup_error)
 
-
-async def _do_transcribe(audio: UploadFile) -> str:
-    print("1. _do_transcribe start")
+    if client is None:
+        raise HTTPException(status_code=500, detail="OpenAI client is not initialized")
 
     data = await audio.read()
-    size = len(data) if data else 0
-    print(f"2. audio bytes = {size}")
-
     if not data:
         raise HTTPException(status_code=400, detail="empty audio")
-
-    if not os.getenv("OPENAI_API_KEY"):
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
 
     suffix = ".webm"
     if audio.filename and "." in audio.filename:
@@ -60,9 +66,6 @@ async def _do_transcribe(audio: UploadFile) -> str:
             tmp_path = tmp.name
             tmp.write(data)
 
-        print(f"3. temp file saved = {tmp_path}")
-        print("4. calling OpenAI transcription...")
-
         with open(tmp_path, "rb") as f:
             tr = client.audio.transcriptions.create(
                 model="gpt-4o-mini-transcribe",
@@ -70,15 +73,9 @@ async def _do_transcribe(audio: UploadFile) -> str:
                 language="ja",
             )
 
-        print("5. OpenAI transcription done")
-
-        text = tr.text or ""
-        print(f"6. transcript length = {len(text)}")
-
-        return text
+        return {"ok": True, "text": tr.text or ""}
 
     except Exception as e:
-        print("ERROR in _do_transcribe")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"transcribe failed: {str(e)}")
 
@@ -86,13 +83,5 @@ async def _do_transcribe(audio: UploadFile) -> str:
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
-                print("7. temp file removed")
             except Exception:
                 pass
-
-
-@app.post("/api/transcribe")
-async def transcribe(audio: UploadFile = File(...)):
-    print("POST /api/transcribe called")
-    text = await _do_transcribe(audio)
-    return {"ok": True, "text": text}
