@@ -233,6 +233,7 @@ def health():
         "ok": True,
         "has_api_key": bool(os.getenv("OPENAI_API_KEY")),
         "startup_error": startup_error,
+        "version": "transcribe_returns_excel_json_text_v1",
     }
 
 
@@ -275,8 +276,7 @@ async def transcribe(audio: UploadFile = File(...)):
 
         return {
             "ok": True,
-            "text": transcript_text,
-            "summary_json": summary_json,
+            "text": summary_json,
         }
 
     except HTTPException:
