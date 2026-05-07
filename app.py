@@ -1,10 +1,11 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from openai import OpenAI
-import tempfile
-import os
-import traceback
+from pydantic import BaseModel
+from openpyxl import load_workbook
+import io
 import json
+import os
 from copy import deepcopy
 
 app = FastAPI()
@@ -17,31 +18,40 @@ app.add_middleware(
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     ],
-    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-client = None
-startup_error = None
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-try:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if api_key:
-        client = OpenAI(api_key=api_key, timeout=60.0)
-    else:
-        startup_error = "OPENAI_API_KEY is not set"
-except Exception as e:
-    startup_error = f"OpenAI client init failed: {str(e)}"
+TEMPLATE_PATH = os.path.join(
+    BASE_DIR,
+    "templates",
+    "08_ﾓﾆﾀﾘﾝｸﾞ結果印刷_ACE既定（モニタリング）_202404.xlsx"
+)
+
+
+class ExcelRequest(BaseModel):
+    summary_json: str | None = None
+    text: str | None = None
+    transcript: str | None = None
 
 
 DEFAULT_REPORT = {
     "実施日": "",
     "前回実施日": "",
     "次回予定日": "",
+
     "利用者名": "",
     "利用者名カナ": "",
     "出力氏名": "",
+    "性別": "",
+    "生年月日": "",
+    "年齢": "",
+    "介護度": "",
+    "認定開始日": "",
+    "認定終了日": "",
+
     "住所": "",
     "住所1": "",
     "住所2": "",
@@ -50,15 +60,18 @@ DEFAULT_REPORT = {
     "電話番号1": "",
     "担当名": "",
     "ケアマネ姓名": "",
+
     "お話伺った人1": "",
     "お話伺った人2": "",
     "お話伺った人3": "",
     "お話伺った人その他": "",
     "確認方法1": "",
     "確認方法2": "",
+
     "専門相談員による結果": "",
     "福祉用具利用目標": [],
     "商品一覧": [],
+
     "身体状況の変化1": "",
     "身体状況の変化2": "",
     "身体状況の変化備考": "",
@@ -77,6 +90,7 @@ DEFAULT_REPORT = {
 
 DEFAULT_GOAL = {
     "目標": "",
+    "達成度": "",
     "達成度1": "",
     "達成度2": "",
     "達成度3": "",
@@ -84,6 +98,8 @@ DEFAULT_GOAL = {
 }
 
 DEFAULT_PRODUCT = {
+    "対応理由記号": "",
+    "選択制対象区分": "",
     "サービス名": "",
     "利用開始日": "",
     "商品名": "",
@@ -97,63 +113,9 @@ DEFAULT_PRODUCT = {
 }
 
 
-def build_prompt(transcript: str) -> str:
-    return f"""
-# 指示
-あなたは福祉用具レンタル事業所のモニタリング担当です。
-次の「福祉用具レンタル事業所の担当者」と「利用者・家族・関係者」による対話記録から、
-モニタリング帳票入力用のJSON形式で出力してください。
-
-必ずJSONのみを返してください。
-説明文、Markdown、コードブロックは禁止です。
-すべてのキーを必ず出力してください。
-値が不明な場合は空文字、配列項目は空配列で返してください。
-
-JSON形式:
-{json.dumps(DEFAULT_REPORT, ensure_ascii=False, indent=2)}
-
-配列要素の形式:
-
-福祉用具利用目標 の1件:
-{json.dumps(DEFAULT_GOAL, ensure_ascii=False, indent=2)}
-
-商品一覧 の1件:
-{json.dumps(DEFAULT_PRODUCT, ensure_ascii=False, indent=2)}
-
-補足:
-- 福祉用具利用目標 は最大4件
-- 商品一覧 は最大8件
-- 達成度や変化項目は「☑」「✓」「有」「該当」など短い表現で可
-- 帳票向けに短く簡潔にしてください
-- 会話にない内容は推測しすぎず空文字にしてください
-
-文字起こし:
-{transcript}
-""".strip()
-
-
-def extract_text_from_response(res) -> str:
-    if hasattr(res, "output_text") and res.output_text:
-        return res.output_text
-
-    try:
-        parts = []
-        for out in getattr(res, "output", []):
-            for content in getattr(out, "content", []):
-                text_value = getattr(content, "text", None)
-                if text_value:
-                    parts.append(text_value)
-        joined = "\n".join(parts).strip()
-        if joined:
-            return joined
-    except Exception:
-        pass
-
-    return str(res)
-
-
 def merge_dict(defaults: dict, actual: dict) -> dict:
     result = deepcopy(defaults)
+
     if not isinstance(actual, dict):
         return result
 
@@ -205,25 +167,176 @@ def safe_json(text: str) -> dict:
         return fallback
 
 
-def create_summary_json(transcript: str) -> str:
-    prompt = build_prompt(transcript)
+def set_if_exists(ws, cell_ref: str, value):
+    ws[cell_ref] = "" if value is None else value
 
-    res = client.responses.create(
-        model="gpt-5-mini",
-        input=prompt,
+
+def norm(value) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def mark_choice(value, expected_values) -> str:
+    value = norm(value)
+    expected_values = [str(v).strip() for v in expected_values]
+    return "〇" if value in expected_values else ""
+
+
+def mark_achievement(g: dict, no: int) -> str:
+    value = (
+        norm(g.get("達成度"))
+        or norm(g.get("達成度1"))
+        or norm(g.get("達成度2"))
+        or norm(g.get("達成度3"))
     )
 
-    text = extract_text_from_response(res)
-    report = safe_json(text)
+    if no == 1:
+        return "〇" if value in ["1", "達成"] else ""
+    if no == 2:
+        return "〇" if value in ["2", "一部達成"] else ""
+    if no == 3:
+        return "〇" if value in ["3", "未達成"] else ""
 
-    return json.dumps(report, ensure_ascii=False)
+    return ""
+
+
+def has_product_value(p: dict) -> bool:
+    return bool(
+        norm(p.get("サービス名"))
+        or norm(p.get("商品名"))
+        or norm(p.get("利用開始日"))
+        or norm(p.get("モニタリング備考"))
+    )
+
+
+def fill_monitoring_sheet(wb, data: dict):
+    ws = wb["レイアウト_モニタリング"]
+
+    mapping = {
+        "AC3": data.get("実施日", ""),
+        "AC4": data.get("前回実施日", ""),
+
+        "AP3": data.get("利用者名", ""),
+        "AP2": data.get("利用者名カナ", ""),
+        "AP4": data.get("出力氏名", ""),
+
+        # 利用者情報欄
+        "C12": data.get("利用者名カナ", ""),
+        "C13": data.get("利用者名", ""),
+        "R13": data.get("性別", ""),
+        "T13": data.get("生年月日", ""),
+        "Y13": data.get("年齢", ""),
+        "AA13": data.get("介護度", ""),
+        "AE13": data.get("認定開始日", ""),
+        "AK13": data.get("認定終了日", ""),
+
+        "AC5": data.get("お話伺った人1", ""),
+        "AG5": data.get("お話伺った人2", ""),
+        "AJ5": data.get("お話伺った人3", ""),
+        "AL5": data.get("お話伺った人その他", ""),
+        "AC6": data.get("確認方法1", ""),
+        "AG6": data.get("確認方法2", ""),
+        "AC8": data.get("担当名", ""),
+
+        "AP5": data.get("住所", ""),
+        "AR15": data.get("住所1", ""),
+        "AR16": data.get("住所2", ""),
+        "AR17": data.get("住所3", ""),
+        "AP6": data.get("電話番号", ""),
+        "AI15": data.get("電話番号1", ""),
+        "AI16": data.get("ケアマネ姓名", ""),
+
+        "J91": data.get("専門相談員による結果", ""),
+        "AA98": data.get("次回予定日", ""),
+
+        "F85": mark_choice(data.get("身体状況の変化1", ""), ["なし", "0"]),
+        "F86": mark_choice(data.get("身体状況の変化2", ""), ["あり", "1"]),
+        "J85": data.get("身体状況の変化備考", ""),
+
+        "Z85": mark_choice(data.get("ご家族状況の変化1", ""), ["なし", "0"]),
+        "Z86": mark_choice(data.get("ご家族状況の変化2", ""), ["あり", "1"]),
+        "AD85": data.get("ご家族状況の変化備考", ""),
+
+        "F87": mark_choice(data.get("お気持ちの変化1", ""), ["なし", "0"]),
+        "F88": mark_choice(data.get("お気持ちの変化2", ""), ["あり", "1"]),
+        "J87": data.get("お気持ちの変化備考", ""),
+
+        "Z87": mark_choice(data.get("生活状況の変化1", ""), ["なし", "0"]),
+        "Z88": mark_choice(data.get("生活状況の変化2", ""), ["あり", "1"]),
+        "AD87": data.get("生活状況の変化備考", ""),
+
+        "F91": mark_choice(data.get("見直しの必要性1", ""), ["なし", "0"]),
+        "F94": mark_choice(data.get("見直しの必要性2", ""), ["あり", "1"]),
+    }
+
+    for cell_ref, value in mapping.items():
+        set_if_exists(ws, cell_ref, value)
+
+    goal_rows = [20, 23, 26, 29]
+    goals = data.get("福祉用具利用目標", [])
+
+    for i, row in enumerate(goal_rows):
+        g = goals[i] if i < len(goals) else DEFAULT_GOAL
+
+        set_if_exists(ws, f"C{row}", g.get("目標", ""))
+        set_if_exists(ws, f"V{row}", mark_achievement(g, 1))
+        set_if_exists(ws, f"V{row + 1}", mark_achievement(g, 2))
+        set_if_exists(ws, f"V{row + 2}", mark_achievement(g, 3))
+        set_if_exists(ws, f"Z{row}", g.get("備考", ""))
+
+    product_rows = [35, 41, 47, 53, 59, 65, 71, 77]
+    products = data.get("商品一覧", [])
+
+    for i, row in enumerate(product_rows):
+        p = products[i] if i < len(products) else DEFAULT_PRODUCT
+
+        if not has_product_value(p):
+            continue
+
+        item_row = row + 3
+
+        set_if_exists(ws, f"A{row}", p.get("対応理由記号", ""))
+        set_if_exists(ws, f"A{item_row}", p.get("選択制対象区分", ""))
+
+        set_if_exists(ws, f"C{row}", p.get("サービス名", ""))
+        set_if_exists(ws, f"O{row}", p.get("利用開始日", ""))
+        set_if_exists(ws, f"AB{row}", p.get("モニタリング備考", ""))
+
+        set_if_exists(ws, f"R{row}", mark_choice(
+            p.get("使用状況の問題1", ""),
+            ["なし", "0", "問題なし"]
+        ))
+        set_if_exists(ws, f"U{row}", mark_choice(
+            p.get("点検結果1", ""),
+            ["問題なし", "なし", "0"]
+        ))
+        set_if_exists(ws, f"Y{row}", mark_choice(
+            p.get("今後の方針1", ""),
+            ["継続", "1"]
+        ))
+
+        set_if_exists(ws, f"C{item_row}", p.get("商品名", ""))
+
+        set_if_exists(ws, f"R{item_row}", mark_choice(
+            p.get("使用状況の問題2", ""),
+            ["あり", "1", "問題あり"]
+        ))
+        set_if_exists(ws, f"U{item_row}", mark_choice(
+            p.get("点検結果2", ""),
+            ["問題あり", "あり", "1"]
+        ))
+        set_if_exists(ws, f"Y{item_row}", mark_choice(
+            p.get("今後の方針2", ""),
+            ["再検討", "2"]
+        ))
+
+    return wb
 
 
 @app.get("/")
 def root():
     return {
         "ok": True,
-        "startup_error": startup_error,
+        "service": "monitoring-excel-api",
     }
 
 
@@ -231,64 +344,50 @@ def root():
 def health():
     return {
         "ok": True,
-        "has_api_key": bool(os.getenv("OPENAI_API_KEY")),
-        "startup_error": startup_error,
-        "version": "transcribe_returns_excel_json_text_v1",
+        "template_exists": os.path.exists(TEMPLATE_PATH),
+        "template_path": TEMPLATE_PATH,
+        "version": "excel_output_choice_mark_v2",
     }
 
 
-@app.post("/api/transcribe")
-async def transcribe(audio: UploadFile = File(...)):
-    if startup_error:
-        raise HTTPException(status_code=500, detail=startup_error)
+@app.post("/api/report-excel")
+def report_excel(req: ExcelRequest):
+    if not os.path.exists(TEMPLATE_PATH):
+        raise HTTPException(status_code=500, detail="template file not found")
 
-    if client is None:
-        raise HTTPException(status_code=500, detail="OpenAI client is not initialized")
+    raw_text = (
+        req.summary_json
+        or req.text
+        or req.transcript
+        or ""
+    ).strip()
 
-    data = await audio.read()
-    if not data:
-        raise HTTPException(status_code=400, detail="empty audio")
-
-    suffix = ".webm"
-    if audio.filename and "." in audio.filename:
-        suffix = "." + audio.filename.rsplit(".", 1)[-1].lower()
-
-    tmp_path = None
+    if not raw_text:
+        raise HTTPException(
+            status_code=400,
+            detail="summary_json or text or transcript empty"
+        )
 
     try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp_path = tmp.name
-            tmp.write(data)
+        report = safe_json(raw_text)
 
-        with open(tmp_path, "rb") as f:
-            tr = client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=f,
-                language="ja",
-            )
+        wb = load_workbook(TEMPLATE_PATH)
+        wb = fill_monitoring_sheet(wb, report)
 
-        transcript_text = tr.text or ""
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
 
-        if not transcript_text.strip():
-            raise HTTPException(status_code=500, detail="transcription result empty")
-
-        summary_json = create_summary_json(transcript_text)
-
-        return {
-            "ok": True,
-            "text": summary_json,
-        }
+        return StreamingResponse(
+            buf,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": 'attachment; filename="monitoring_report.xlsx"'
+            },
+        )
 
     except HTTPException:
         raise
 
     except Exception as e:
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"transcribe failed: {str(e)}")
-
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except Exception:
-                pass
+        raise HTTPException(status_code=500, detail=str(e))
