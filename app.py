@@ -6,6 +6,7 @@ import os
 import traceback
 import json
 from copy import deepcopy
+import ffmpeg
 
 app = FastAPI()
 
@@ -39,61 +40,47 @@ DEFAULT_REPORT = {
     "実施日": "",
     "前回実施日": "",
     "次回予定日": "",
-
     "利用者名": "",
     "利用者名カナ": "",
     "出力氏名": "",
-
     "性別": "",
     "生年月日": "",
     "年齢": "",
     "介護度": "",
     "認定開始日": "",
     "認定終了日": "",
-
     "住所": "",
     "住所1": "",
     "住所2": "",
     "住所3": "",
     "電話番号": "",
     "電話番号1": "",
-
     "担当名": "",
     "ケアマネ姓名": "",
-
     "お話伺った人1": "",
     "お話伺った人2": "",
     "お話伺った人3": "",
     "お話伺った人その他": "",
-
     "確認方法1": "",
     "確認方法2": "",
-
     "専門相談員による結果": "",
-
     "福祉用具利用目標": [],
     "商品一覧": [],
-
     "身体状況の変化1": "",
     "身体状況の変化2": "",
     "身体状況の変化備考": "",
-
     "ご家族状況の変化1": "",
     "ご家族状況の変化2": "",
     "ご家族状況の変化備考": "",
-
     "お気持ちの変化1": "",
     "お気持ちの変化2": "",
     "お気持ちの変化備考": "",
-
     "生活状況の変化1": "",
     "生活状況の変化2": "",
     "生活状況の変化備考": "",
-
     "見直しの必要性1": "",
     "見直しの必要性2": ""
 }
-
 
 DEFAULT_GOAL = {
     "目標": "",
@@ -101,25 +88,36 @@ DEFAULT_GOAL = {
     "備考": ""
 }
 
-
 DEFAULT_PRODUCT = {
     "対応理由記号": "",
     "選択制対象区分": "",
-
     "サービス名": "",
     "利用開始日": "",
     "商品名": "",
-
     "使用状況の問題1": "",
     "点検結果1": "",
     "今後の方針1": "",
-
     "使用状況の問題2": "",
     "点検結果2": "",
     "今後の方針2": "",
-
     "モニタリング備考": ""
 }
+
+
+def convert_audio_to_mp3(input_path: str, output_path: str):
+    (
+        ffmpeg
+        .input(input_path)
+        .output(
+            output_path,
+            acodec="libmp3lame",
+            ac=1,
+            ar="44100",
+            format="mp3"
+        )
+        .overwrite_output()
+        .run(quiet=True)
+    )
 
 
 def build_prompt(transcript: str) -> str:
@@ -262,6 +260,15 @@ def create_summary_json(transcript: str) -> str:
     return json.dumps(report, ensure_ascii=False)
 
 
+def transcribe_file(file_path: str):
+    with open(file_path, "rb") as f:
+        return client.audio.transcriptions.create(
+            model="gpt-4o-mini-transcribe",
+            file=f,
+            language="ja",
+        )
+
+
 @app.get("/")
 def root():
     return {
@@ -276,7 +283,7 @@ def health():
         "ok": True,
         "has_api_key": bool(os.getenv("OPENAI_API_KEY")),
         "startup_error": startup_error,
-        "version": "transcribe_returns_excel_json_text_v2",
+        "version": "transcribe_api_side_audio_convert_v3",
     }
 
 
@@ -297,18 +304,28 @@ async def transcribe(audio: UploadFile = File(...)):
         suffix = "." + audio.filename.rsplit(".", 1)[-1].lower()
 
     tmp_path = None
+    converted_path = None
 
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
             tmp_path = tmp.name
             tmp.write(data)
 
-        with open(tmp_path, "rb") as f:
-            tr = client.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=f,
-                language="ja",
-            )
+        print("filename =", audio.filename)
+        print("content_type =", audio.content_type)
+        print("size =", len(data))
+        print("suffix =", suffix)
+
+        try:
+            tr = transcribe_file(tmp_path)
+
+        except Exception as first_error:
+            print("first transcription failed:", str(first_error))
+
+            converted_path = tmp_path + ".mp3"
+            convert_audio_to_mp3(tmp_path, converted_path)
+
+            tr = transcribe_file(converted_path)
 
         transcript_text = tr.text or ""
 
@@ -333,5 +350,11 @@ async def transcribe(audio: UploadFile = File(...)):
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
+            except Exception:
+                pass
+
+        if converted_path and os.path.exists(converted_path):
+            try:
+                os.remove(converted_path)
             except Exception:
                 pass
