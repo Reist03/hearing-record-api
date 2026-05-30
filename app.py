@@ -29,7 +29,7 @@ startup_error = None
 try:
     api_key = os.getenv("OPENAI_API_KEY")
     if api_key:
-        client = OpenAI(api_key=api_key, timeout=60.0)
+        client = OpenAI(api_key=api_key, timeout=1800.0)
     else:
         startup_error = "OPENAI_API_KEY is not set"
 except Exception as e:
