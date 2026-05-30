@@ -296,15 +296,16 @@ async def transcribe(audio: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail="OpenAI client is not initialized")
 
     data = await audio.read()
+
     if not data:
         raise HTTPException(status_code=400, detail="empty audio")
 
     suffix = ".webm"
+
     if audio.filename and "." in audio.filename:
         suffix = "." + audio.filename.rsplit(".", 1)[-1].lower()
 
     tmp_path = None
-    converted_path = None
 
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
@@ -316,27 +317,84 @@ async def transcribe(audio: UploadFile = File(...)):
         print("size =", len(data))
         print("suffix =", suffix)
 
-        try:
-            tr = transcribe_file(tmp_path)
+        transcript_parts = []
 
-        except Exception as first_error:
-            print("first transcription failed:", str(first_error))
+        with tempfile.TemporaryDirectory() as split_dir:
 
-            converted_path = tmp_path + ".mp3"
-            convert_audio_to_mp3(tmp_path, converted_path)
+            output_pattern = os.path.join(split_dir, "part_%03d.mp3")
 
-            tr = transcribe_file(converted_path)
+            (
+                ffmpeg
+                .input(tmp_path)
+                .output(
+                    output_pattern,
+                    f="segment",
+                    segment_time=600,
+                    reset_timestamps=1,
+                    acodec="libmp3lame",
+                    ac=1,
+                    ar="44100",
+                    format="mp3"
+                )
+                .overwrite_output()
+                .run(quiet=True)
+            )
 
-        transcript_text = tr.text or ""
+            part_files = sorted(
+                os.path.join(split_dir, f)
+                for f in os.listdir(split_dir)
+                if f.startswith("part_") and f.endswith(".mp3")
+            )
 
-        if not transcript_text.strip():
-            raise HTTPException(status_code=500, detail="transcription result empty")
+            if not part_files:
+                raise HTTPException(
+                    status_code=500,
+                    detail="audio split failed"
+                )
 
-        summary_json = create_summary_json(transcript_text)
+            print("split parts =", len(part_files))
+
+            for index, part_path in enumerate(part_files, start=1):
+
+                print(
+                    f"transcribing part {index}/{len(part_files)}"
+                )
+
+                try:
+                    tr = transcribe_file(part_path)
+
+                    part_text = tr.text or ""
+
+                    if part_text.strip():
+                        transcript_parts.append(
+                            part_text.strip()
+                        )
+
+                except Exception as part_error:
+
+                    print(
+                        f"part {index} failed:",
+                        str(part_error)
+                    )
+
+        transcript_text = "\n".join(
+            transcript_parts
+        ).strip()
+
+        if not transcript_text:
+            raise HTTPException(
+                status_code=500,
+                detail="transcription result empty"
+            )
+
+        summary_json = create_summary_json(
+            transcript_text
+        )
 
         return {
             "ok": True,
             "text": summary_json,
+            "parts": len(transcript_parts)
         }
 
     except HTTPException:
@@ -344,17 +402,16 @@ async def transcribe(audio: UploadFile = File(...)):
 
     except Exception as e:
         print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"transcribe failed: {str(e)}")
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"transcribe failed: {str(e)}"
+        )
 
     finally:
+
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
-            except Exception:
-                pass
-
-        if converted_path and os.path.exists(converted_path):
-            try:
-                os.remove(converted_path)
             except Exception:
                 pass
