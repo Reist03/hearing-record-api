@@ -104,22 +104,6 @@ DEFAULT_PRODUCT = {
 }
 
 
-def convert_audio_to_mp3(input_path: str, output_path: str):
-    (
-        ffmpeg
-        .input(input_path)
-        .output(
-            output_path,
-            acodec="libmp3lame",
-            ac=1,
-            ar="44100",
-            format="mp3"
-        )
-        .overwrite_output()
-        .run(quiet=True)
-    )
-
-
 def build_prompt(transcript: str) -> str:
     return f"""
 # 指示
@@ -283,7 +267,7 @@ def health():
         "ok": True,
         "has_api_key": bool(os.getenv("OPENAI_API_KEY")),
         "startup_error": startup_error,
-        "version": "transcribe_api_side_audio_convert_v3",
+        "version": "transcribe_api_side_audio_convert_v4",
     }
 
 
@@ -319,31 +303,30 @@ async def transcribe(audio: UploadFile = File(...)):
 
         transcript_parts = []
 
-with tempfile.TemporaryDirectory() as split_dir:
+        with tempfile.TemporaryDirectory() as split_dir:
+            output_pattern = os.path.join(split_dir, "part_%03d.mp3")
 
-    output_pattern = os.path.join(split_dir, "part_%03d.mp3")
+            (
+                ffmpeg
+                .input(tmp_path)
+                .output(
+                    output_pattern,
+                    f="segment",
+                    segment_time=600,
+                    reset_timestamps=1,
+                    acodec="libmp3lame",
+                    ac=1,
+                    ar="44100"
+                )
+                .overwrite_output()
+                .run(quiet=True)
+            )
 
-    (
-        ffmpeg
-        .input(tmp_path)
-        .output(
-            output_pattern,
-            f="segment",
-            segment_time=600,
-            reset_timestamps=1,
-            acodec="libmp3lame",
-            ac=1,
-            ar="44100"
-        )
-        .overwrite_output()
-        .run(quiet=True)
-    )
-
-    part_files = sorted(
-        os.path.join(split_dir, f)
-        for f in os.listdir(split_dir)
-        if f.startswith("part_") and f.endswith(".mp3")
-    )
+            part_files = sorted(
+                os.path.join(split_dir, f)
+                for f in os.listdir(split_dir)
+                if f.startswith("part_") and f.endswith(".mp3")
+            )
 
             if not part_files:
                 raise HTTPException(
@@ -354,31 +337,19 @@ with tempfile.TemporaryDirectory() as split_dir:
             print("split parts =", len(part_files))
 
             for index, part_path in enumerate(part_files, start=1):
-
-                print(
-                    f"transcribing part {index}/{len(part_files)}"
-                )
+                print(f"transcribing part {index}/{len(part_files)}")
 
                 try:
                     tr = transcribe_file(part_path)
-
                     part_text = tr.text or ""
 
                     if part_text.strip():
-                        transcript_parts.append(
-                            part_text.strip()
-                        )
+                        transcript_parts.append(part_text.strip())
 
                 except Exception as part_error:
+                    print(f"part {index} failed:", str(part_error))
 
-                    print(
-                        f"part {index} failed:",
-                        str(part_error)
-                    )
-
-        transcript_text = "\n".join(
-            transcript_parts
-        ).strip()
+        transcript_text = "\n".join(transcript_parts).strip()
 
         if not transcript_text:
             raise HTTPException(
@@ -386,9 +357,7 @@ with tempfile.TemporaryDirectory() as split_dir:
                 detail="transcription result empty"
             )
 
-        summary_json = create_summary_json(
-            transcript_text
-        )
+        summary_json = create_summary_json(transcript_text)
 
         return {
             "ok": True,
@@ -408,7 +377,6 @@ with tempfile.TemporaryDirectory() as split_dir:
         )
 
     finally:
-
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
