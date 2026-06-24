@@ -319,32 +319,31 @@ async def transcribe(audio: UploadFile = File(...)):
 
         transcript_parts = []
 
-        with tempfile.TemporaryDirectory() as split_dir:
+with tempfile.TemporaryDirectory() as split_dir:
 
-            output_pattern = os.path.join(split_dir, "part_%03d.mp3")
+    output_pattern = os.path.join(split_dir, "part_%03d.mp3")
 
-            (
-                ffmpeg
-                .input(tmp_path)
-                .output(
-                    output_pattern,
-                    f="segment",
-                    segment_time=600,
-                    reset_timestamps=1,
-                    acodec="libmp3lame",
-                    ac=1,
-                    ar="44100",
-                    format="mp3"
-                )
-                .overwrite_output()
-                .run(quiet=True)
-            )
+    (
+        ffmpeg
+        .input(tmp_path)
+        .output(
+            output_pattern,
+            f="segment",
+            segment_time=600,
+            reset_timestamps=1,
+            acodec="libmp3lame",
+            ac=1,
+            ar="44100"
+        )
+        .overwrite_output()
+        .run(quiet=True)
+    )
 
-            part_files = sorted(
-                os.path.join(split_dir, f)
-                for f in os.listdir(split_dir)
-                if f.startswith("part_") and f.endswith(".mp3")
-            )
+    part_files = sorted(
+        os.path.join(split_dir, f)
+        for f in os.listdir(split_dir)
+        if f.startswith("part_") and f.endswith(".mp3")
+    )
 
             if not part_files:
                 raise HTTPException(
